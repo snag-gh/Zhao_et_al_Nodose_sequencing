@@ -1,0 +1,738 @@
+---
+title: "Analysis of Zhao et al public dataset"
+author: "Sushma Nagaraj"
+date: "3/23/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(GEOquery)
+  library(scran)
+  library(scater)
+  library(scuttle)
+  library(ggplot2)
+  library(Matrix)
+  library(DropletUtils)
+  library(cowplot)
+  library(batchelor)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(factoextra)
+  library(RColorBrewer)
+})
+
+here::i_am("src/Zhao_Nodose_ganglion/Zhao_nodose_ganglion_analysis.Rmd")
+source("/home/sushmanagaraj/src/devel/R/SingleCell/functions/functions.R")
+```
+#Get project metadata and any raw data from GEO.
+```{r}
+gse <- getGEO("GSE192987")
+show(gse)
+show(pData(phenoData(gse[[1]])))
+sample_metadata <- pData(phenoData(gse[[1]]))
+write.csv(sample_metadata, file = here::here("data", "sample_metadata.csv"))
+getGEOSuppFiles("GSE192987", baseDir = here::here("data")) 
+```
+
+```{r}
+samples <- paste0(sample_metadata$geo_accession, "_", sample_metadata$title)
+
+sce_list <- vector("list", length(samples))
+sce_list <- lapply(samples, function(s) {
+  zz <- gzfile(here::here("data", "GSE192987", paste0(s, "_matrix.mtx.gz")), 'rt') 
+  mat <- readMM(zz) 
+  zz1 <- gzfile(here::here("data", "GSE192987", paste0(s, "_barcodes.tsv.gz")), 'rt')
+  cells <- read.table(zz1, header = FALSE, sep = "\t")
+  zz2 <- gzfile(here::here("data", "GSE192987", paste0(s, "_genes.tsv.gz")), 'rt')
+  genes <- read.table(zz2, header = FALSE, sep = "\t")
+  sce <- SingleCellExperiment(assays = list(counts = mat), colData = cells, rowData = genes)
+})
+
+names(sce_list) <- sapply(samples, function(s) unlist(strsplit(s, "_")))[2,]
+
+for (i in names(sce_list)) {
+  colnames(colData(sce_list[[i]])) <- "barcode"
+  sce_list[[i]]$sample <- i
+  rownames(colData(sce_list[[i]])) <- paste0(sce_list[[i]]$barcode, ".", sce_list[[i]]$sample)
+  colnames(rowData(sce_list[[i]])) <- c("ensembl_id", "gene_name", "gene_exp")
+}
+
+saveRDS(sce_list, here::here("data", "sce_list.rds"))
+sce <- do.call(cbind, sce_list)
+
+rownames(sce) <- uniquifyFeatureNames(rowData(sce)$ensembl_id, rowData(sce)$gene_name)
+
+library(AnnotationHub)
+ah <- AnnotationHub()
+#ah[ah$species == "Mus musculus" & ah$dataprovider == "Ensembl" & ah$rdataclass == "EnsDb"] #use query()
+ens.mm.v97 <- ah[['AH73905']] #Using GRCm38 for mm10
+#columns(ens.mm.v97)
+#keytypes(ens.mm.v97)
+location <- mapIds(ens.mm.v97, keys = rowData(sce)$ensembl_id, keytype = "GENEID", column = "SEQNAME")
+rowData(sce)$chr <- location
+
+saveRDS(sce, file = here::here("data", "sce.rds"))
+```
+
+#Knee plots
+```{r}
+pdf(here::here("qc", "knee_plots.pdf"))
+lapply(sce_list, function(sce) {
+  bcrank <- barcodeRanks(counts(sce))
+  all(rownames(bcrank) == colnames(sce))
+  knee <- metadata(bcrank)$knee
+  inflection <- metadata(bcrank)$inflection
+  umi.ge.knee <- sum(bcrank$total >= knee)
+  umi.ge.500 <- sum(bcrank$total >= 500)
+  umi.ge.inflection <- sum(bcrank$total >= inflection)
+  bcrank <- as.data.frame(bcrank)
+  gg_color_hue <- function(n) {hcl(h=seq(15, 375, length=n+1), l=65, c=100)[1:n]}
+  plot.colors <- gg_color_hue(2)
+  ggplot(bcrank, aes(x = rank, y = total)) + geom_point(size = 0.5, show.legend = TRUE) + scale_x_continuous(trans = "log10") + scale_y_continuous(trans = "log10") + geom_hline(mapping = aes(yintercept = knee, fill = "Knee"), linetype = "dashed", size = 0.5, color = "dodgerblue") + geom_hline(mapping = aes(yintercept = inflection, fill = "Inflection"), linetype = "dashed", size = 0.5, color = "darkgreen") + geom_hline(mapping = aes(yintercept = 500, fill = "500UMI"), linetype = "dashed", size = 0.5, color = "orange") + scale_color_manual(values=c(plot.colors, "darkgrey")) + scale_fill_manual("UMI", values = rep(1,3), guide=guide_legend(override.aes = list(colour=c("orange", "darkgreen", "dodgerblue")))) + labs(x = "Rank", y= "Total UMI count", title = paste0(sce$sample[1], " Knee=", umi.ge.knee, ",", round(knee), "; Inflection=", umi.ge.inflection, ",", round(inflection), "; ", umi.ge.500, ",", "500")) + theme_bw()
+})
+dev.off()
+```
+#QC
+```{r qc}
+mito <- which(rowData(sce)$chr == "MT")
+stats <- perCellQCMetrics(sce, subsets = list(Mt = mito))
+colData(sce) <- cbind(colData(sce), stats)
+sce$sample <- as.factor(sce$sample)
+
+detected.discard <- stats$detected <= 500
+mito.discard <- stats$subsets_Mt_percent > 10
+
+data.frame(detected = sum(detected.discard), mito = sum(mito.discard), total = sum(discard))
+discard <- detected.discard | mito.discard
+sce$discard <- discard
+
+pdf(here::here("qc", "qc.pdf"), height = 10, width = 10)
+cowplot::plot_grid(
+  plotColData(sce, x="sample", y="sum", colour_by = "discard") + scale_y_log10() + ggtitle("Total count") + theme(axis.text.x = element_text(angle = 90)),
+  plotColData(sce, x="sample", y="detected", colour_by = "discard") + scale_y_log10() + ggtitle("Detected features") + theme(axis.text.x = element_text(angle = 90)),
+  plotColData(sce, x="sample", y="subsets_Mt_percent", colour_by = "discard") + ggtitle("Mito percent") + theme(axis.text.x = element_text(angle = 90)),
+  nrow = 2, ncol = 2
+)
+dev.off()
+
+sce <- sce[, !discard]
+```
+
+```{r}
+plotExpression(sce, features = c("WPRE", "tdTomato", "eGFP", "QZ1", "QZ2", "QZ3", "QZ4", "QZ5", "QZ6", "QZ7", "QZ8", "newGlp1r"), exprs_values = "counts", x = I(as.factor(sce$sample)), col = I(as.factor(sce$sample))) + theme(axis.text.x = element_text(angle = 90))
+```
+# Normalization
+```{r normalization}
+set.seed(1000)
+clusters <- quickCluster(sce)
+table(clusters)
+sce <- computeSumFactors(sce, cluster = clusters)
+sce <- logNormCounts(sce)
+summary(sizeFactors(sce))
+plot(librarySizeFactors(sce), sizeFactors(sce), pch = 16, xlab = "library size factors", ylab = "Deconvolution factors", log = "xy")
+```
+# Variance modelling
+```{r variance_modelling}
+dec <- modelGeneVar(sce, block = sce$sample)
+chosen.hvgs <- getTopHVGs(dec, prop = 0.2)
+par(mfrow = c(4,2))
+blocked.stats <- dec$per.block
+pdf(here::here("plots", "Variance_modeling.pdf"))
+for (i in colnames(blocked.stats)) {
+  current <- blocked.stats[[i]]
+  hv <- current[current$total >= 1, ]
+  plot(current$mean, current$total, main = i, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+  text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+  curfit <- metadata(current)
+  curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+}
+dev.off()
+```
+# Batch Correction
+```{r}
+set.seed(0010101010)
+uncorrected <- runPCA(sce, subset_row = chosen.hvgs, BSPARAM = BiocSingular::RandomParam()) 
+percent.var <- attr(reducedDim(uncorrected), "percentVar")
+chosen.elbow <- PCAtools::findElbowPoint(percent.var)
+plot(percent.var, xlab = "PC", ylab = "Variance explained (%)")
+abline(v=chosen.elbow, col = "red")
+snn.gr.uncorr <- buildSNNGraph(uncorrected, use.dimred = "PCA")
+clusters.uncorr <- igraph::cluster_walktrap(snn.gr.uncorr)$membership
+tab.uncorr <- table(Cluster = clusters.uncorr, Batch = uncorrected$sample)
+tab.uncorr
+
+set.seed(1111001)
+uncorrected <- runTSNE(uncorrected, dimred = "PCA")
+plotTSNE(uncorrected, colour_by = "sample")
+
+library(batchelor)
+set.seed(1000101001)
+mnn.out <- fastMNN(sce, subset.row = chosen.hvgs, d = 50, batch = sce$sample, BSPARAM = BiocSingular::RandomParam(deferred = TRUE))
+snn.gr <- buildSNNGraph(mnn.out, use.dimred = "corrected")
+clusters.mnn <- igraph::cluster_walktrap(snn.gr)$membership
+tab.mnn <- table(Cluster = clusters.mnn, Batch = mnn.out$batch)
+tab.mnn
+
+set.seed(1111001)
+mnn.out <- runTSNE(mnn.out, dimred = "corrected")
+plotTSNE(mnn.out, colour_by = "batch") + ggtitle("MNN batch correction")
+
+pdf(here::here("plots", "batch_correction.pdf"))
+cowplot::plot_grid(
+  plotTSNE(uncorrected, colour_by = "sample", point_size = 1) + ggtitle("batch effects"),
+  plotTSNE(mnn.out, colour_by = "batch", point_size = 1) + ggtitle("MNN batch correction"),
+  nrow = 2
+)
+dev.off()
+
+# proportion of variance lost
+metadata(mnn.out)$merge.info$lost.var
+
+reducedDim(sce, "corrected") <- reducedDim(mnn.out, "corrected")
+```
+
+# Dimentionality reduction
+```{r reduce_dim}
+set.seed(1111001)
+sce <- runTSNE(sce, dimred = "corrected")
+tsne <- plotTSNE(sce, colour_by = "sample", point_size = 1)
+
+set.seed(1100101001)
+sce <- runUMAP(sce, dimred = "corrected")
+umap <- plotUMAP(sce, colour_by = "sample", point_size = 1)
+
+pdf(here::here("plots", "TSNE_UMAP.by_sample.pdf"))
+gridExtra::grid.arrange(tsne, umap, nrow = 2)
+dev.off()
+```
+
+
+```{r clustering}
+g <- buildSNNGraph(sce, k = 10, use.dimred = "corrected")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+sce$cluster.k10 <- factor(clust)
+table(sce$cluster.k10, sce$sample)
+```
+```{r doublets}
+library(scDblFinder)
+sce <- scDblFinder(sce, samples = "sample")
+pdf(here(dir, "cluster.k10", "Doublet_scores.pdf"))
+plotColData(sce, x = "cluster.k10", y = "scDblFinder.score", colour_by = "scDblFinder.class")
+plotColData(sce, x = "cluster.k10", y = "scDblFinder.score", colour_by = "detected")
+dev.off()
+
+plotDoubletMap(sce)
+```
+
+
+#Subsetting to only placode derived Vagal neurons
+```{r}
+###Subset neurons. Neurons express Slc17a6, Syn1
+pdf(here::here("cluster.k10", "cell_types.pdf"))
+plotExpression(sce, features = c("Slc17a6", "Syn1", "Apoe", "Cldn5"), x = I(as.factor(sce$cluster.k10)), colour_by = I(as.factor(sce$cluster.k10)), point_size = 0, show_violin = TRUE)
+gridExtra::grid.arrange(
+plotUMAP(sce, colour_by = "Slc17a6", point_size = 0.5, text_by = "cluster.k10"),
+plotUMAP(sce, colour_by = "Syn1", point_size = 0.5, text_by = "cluster.k10"),
+plotUMAP(sce, colour_by = "Apoe", point_size = 1, text_by = "cluster.k10"),
+plotUMAP(sce, colour_by = "Cldn5", point_size = 1, text_by = "cluster.k10"),
+nrow = 2)
+dev.off()
+
+sce$ann.celltype <- "Neurons"
+sce$ann.celltype[sce$cluster.k10 %in% c(7,10,11)] <- "Cldn5+ cells"
+sce$ann.celltype[sce$cluster.k10 %in% c(3,4,15,19,20,25)] <- "Apoe+ cells"
+plotUMAP(sce, colour_by = "ann.celltype", point_size = 1, text_by = "ann.celltype")
+plotUMAP(sce, colour_by = "detected", point_size = 1, text_by = "ann.celltype")
+sce.neurons <- sce[,sce$ann.celltype == "Neurons"]
+
+###Subset placode derived VSNs from the nodose ganglia. These cells express Phox2b
+pdf(here::here("cluster.k10", "placode_neuralcrest_neurons.pdf"))
+plotExpression(sce.neurons, features = c("Phox2b", "Prdm12"), x = I(as.factor(sce.neurons$cluster.k10)), colour_by = I(as.factor(sce.neurons$cluster.k10)), point_size = 0, show_violin = TRUE)
+gridExtra::grid.arrange(
+plotUMAP(sce.neurons, colour_by = "cluster.k10", point_size = 1),
+plotUMAP(sce.neurons, colour_by = "Phox2b", point_size = 1),
+plotUMAP(sce.neurons, colour_by = "Prdm12", point_size = 1),
+nrow = 2)
+dev.off()
+
+sce.neurons$ann.neurontype <- "Phox2b" 
+sce.neurons$ann.neurontype[sce.neurons$cluster.k10 %in% c(5,6,13,18)] <- "Prdm12"
+sce.neurons$ann.neurontype[sce.neurons$cluster.k10 %in% c(18)] <- "Phox2b"
+
+dec <- modelGeneVar(sce.neurons, block = sce.neurons$sample)
+chosen.hvgs <- getTopHVGs(dec, prop = 0.2)
+blocked.stats <- dec$per.block
+for (i in colnames(blocked.stats)) {
+  current <- blocked.stats[[i]]
+  hv <- current[current$total >= 1, ]
+  plot(current$mean, current$total, main = i, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+  text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+  curfit <- metadata(current)
+  curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+}
+set.seed(1000101001)
+mnn.out <- fastMNN(sce.neurons, subset.row = chosen.hvgs, d = 50, batch = sce.neurons$sample, BSPARAM = BiocSingular::RandomParam(deferred = TRUE))
+reducedDim(sce.neurons, "corrected") <- reducedDim(mnn.out, "corrected")
+set.seed(1111001)
+sce.neurons <- runTSNE(sce.neurons, dimred = "corrected")
+plotTSNE(sce.neurons, colour_by = "sample", point_size = 1)
+set.seed(1100101001)
+sce.neurons <- runUMAP(sce.neurons, dimred = "corrected")
+plotUMAP(sce.neurons, colour_by = "sample", point_size = 1)
+
+g <- buildSNNGraph(sce.neurons, k = 5, use.dimred = "corrected")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+sce.neurons$cluster.k5.neurons <- factor(clust)
+plotUMAP(sce.neurons, colour_by = "cluster.k5.neurons", point_size = 1, text_by = "cluster.k5.neurons")
+plotUMAP(sce.neurons, colour_by = "Phox2b", point_size = 0.5, text_by = "cluster.k5.neurons")
+plotUMAP(sce.neurons, colour_by = "Prdm12", point_size = 0.5, text_by = "cluster.k5.neurons")
+plotUMAP(sce.neurons, colour_by = "ann.neurontype", point_size = 0.5, text_by = "cluster.k5.neurons")
+plotExpression(sce.neurons, features = c("Phox2b", "Prdm12"), x = I(as.factor(sce.neurons$cluster.k5.neurons)), colour_by = I(as.factor(sce.neurons$cluster.k5.neurons)), point_size = 0, show_violin = TRUE)
+
+sce.neurons$ann.neurontype <- "Phox2b"
+sce.neurons$ann.neurontype[sce.neurons$cluster.k5.neurons %in% c(4,5,10,24,30,19)] <- "Prdm12"
+#Refine clustering
+sce.temp <- sce.neurons[,sce.neurons$cluster.k5.neurons %in% c(21)]
+plotUMAP(sce.temp, colour_by = "cluster.k5.neurons")
+plotUMAP(sce.temp, colour_by = "Prdm12")
+plotUMAP(sce.temp, colour_by = "Phox2b")
+dec <- modelGeneVar(sce.temp, block = sce.temp$sample)
+chosen.hvgs <- getTopHVGs(dec, prop = 0.2)
+blocked.stats <- dec$per.block
+for (i in colnames(blocked.stats)) {
+  current <- blocked.stats[[i]]
+  hv <- current[current$total >= 1, ]
+  plot(current$mean, current$total, main = i, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+  text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+  curfit <- metadata(current)
+  curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+}
+set.seed(1000101001)
+mnn.out <- fastMNN(sce.temp, subset.row = chosen.hvgs, d = 50, batch = sce.temp$sample, BSPARAM = BiocSingular::RandomParam(deferred = TRUE))
+set.seed(1111001)
+sce.temp <- runTSNE(sce.temp, dimred = "corrected")
+plotTSNE(sce.temp, colour_by = "sample", point_size = 1)
+set.seed(1100101001)
+sce.temp <- runUMAP(sce.temp, dimred = "corrected")
+plotUMAP(sce.temp, colour_by = "sample", point_size = 1)
+
+g <- buildSNNGraph(sce.temp, k = 3, use.dimred = "corrected")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+sce.temp$cluster.k5.neurons.sub <- factor(clust)
+plotUMAP(sce.temp, colour_by = "Prdm12")
+plotUMAP(sce.temp, colour_by = "Phox2b")
+plotUMAP(sce.temp, colour_by = "cluster.k5.neurons.sub", text_by = "cluster.k5.neurons.sub")
+plotExpression(sce.temp, features = c("Phox2b", "Prdm12"), x = I(as.factor(sce.temp$cluster.k5.neurons.sub)), colour_by = I(as.factor(sce.temp$cluster.k5.neurons.sub)), point_size = 0, show_violin = TRUE)
+plotUMAP(sce.temp, colour_by = "ann.neurontype", text_by = "cluster.k5.neurons.sub")
+sce.temp$ann.neurontype[sce.temp$cluster.k5.neurons.sub %in% c(1,4,8,9,12,13,15)] <- "Prdm12"
+
+sce.neurons$ann.neurontype[colnames(sce.neurons) %in% colnames(sce.temp[,sce.temp$ann.neurontype == "Prdm12"])] <- "Prdm12"
+saveRDS(sce.neurons, here::here("sce.placode_neuralcrest_neurons.rds"))
+
+sce.vagus <- sce.neurons[,sce.neurons$ann.neurontype == "Phox2b"]
+```
+
+
+#Cluster the placode derived vagal sensory neurons
+```{r}
+dec <- modelGeneVar(sce.vagus, block = sce.vagus$sample)
+chosen.hvgs <- getTopHVGs(dec, prop = 0.2)
+blocked.stats <- dec$per.block
+for (i in colnames(blocked.stats)) {
+  current <- blocked.stats[[i]]
+  hv <- current[current$total >= 1, ]
+  plot(current$mean, current$total, main = i, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+  text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+  curfit <- metadata(current)
+  curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+}
+set.seed(1000101001)
+mnn.out <- fastMNN(sce.vagus, subset.row = chosen.hvgs, d = 100, batch = sce.vagus$sample, BSPARAM = BiocSingular::RandomParam(deferred = TRUE))
+reducedDim(sce.vagus, "corrected") <- reducedDim(mnn.out, "corrected")
+set.seed(1111001)
+sce.vagus <- runTSNE(sce.vagus, dimred = "corrected")
+plotTSNE(sce.vagus, colour_by = "sample", point_size = 1)
+set.seed(1100101001)
+sce.vagus <- runUMAP(sce.vagus, dimred = "corrected")
+plotUMAP(sce.vagus, colour_by = "sample", point_size = 1)
+
+g <- buildSNNGraph(sce.vagus, k = 15, use.dimred = "corrected")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+sce.vagus$cluster.k15.vsn <- factor(clust)
+plotUMAP(sce.vagus, colour_by = "cluster.k15.vsn", point_size = 0.5, text_by = "cluster.k15.vsn")
+lapply(c("Trpv1", "Piezo2", "Gpr65", "P2ry1", "Tmc3", "Calca"), function(g) { plotUMAP(sce.vagus, colour_by = g, point_size = 0.5, text_by = "cluster.k15.vsn")})
+
+pdf(here::here("placode_VSN_analysis", "VSN_subpopulation_marker_genes.dotplots.pdf"))
+plotDots(sce.vagus, features = c("Runx3", "P2ry1", "Gabra1", "Rbp4", "Lamp5", "Grm5", "Gm765", "Slit2", "Ddc", "Ntng1", "Tmc3", "Piezo2", "Sprr1a", "Ecel1", "Gpr65", "Sst", "Uts2b", "Glp1r", "Vip", "Htr3b", "Trpa1", "Car8", "Oxtr", "Calca", "Kcng1", "Trpv1"), group = I(as.factor(sce.vagus$cluster.k15.vsn))) + theme_classic()
+
+plotExp(sce.vagus, c("Runx3", "P2ry1", "Gabra1", "Rbp4", "Lamp5", "Grm5", "Gm765", "Slit2", "Ddc", "Ntng1", "Tmc3", "Piezo2", "Sprr1a", "Ecel1", "Gpr65", "Sst", "Uts2b", "Glp1r", "Vip", "Htr3b", "Trpa1", "Car8", "Oxtr", "Calca", "Kcng1", "Trpv1"), cluster = "cluster.k15.vsn")
+dev.off()
+
+sce.vagus$subpopulation <- "NA"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(5,18)] <- "A"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(14)] <- "B"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(19,10,11)] <- "C"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(17)] <- "D"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(3)] <- "E"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(1,13)] <- "F"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(2)] <- "G"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(4)] <- "H"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(9,16)] <- "I"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(6,7)] <- "J"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(8)] <- "K"
+sce.vagus$subpopulation[sce.vagus$cluster.k15.vsn %in% c(12)] <- "L"
+plotUMAP(sce.vagus, colour_by = "subpopulation", point_size = 0.5, text_by = "cluster.k15.vsn")
+plotUMAP(sce.vagus, colour_by = "subpopulation", point_size = 0.5, text_by = "subpopulation")
+```
+
+#Cells labeled from the visceral organs
+```{r}
+lapply(c("QZ1", "QZ2", "QZ3", "QZ4", "QZ5", "QZ6", "QZ7", "QZ8"), function(g) {plotUMAP(sce.vagus, colour_by = g, point_size = 0.1, point_alpha = 0.4, text_by = "subpopulation")})
+
+plotExpression(sce.vagus, features = c("WPRE", "tdTomato", "eGFP", "QZ1", "QZ2", "QZ3", "QZ4", "QZ5", "QZ6", "QZ7", "QZ8", "newGlp1r"), x = I(as.factor(sce.vagus$sample)), col = I(as.factor(sce.vagus$sample))) + theme(axis.text.x = element_text(angle = 90))
+
+sce.vagus$group <- "control"
+sce.vagus$group[sce.vagus$sample %in% c("vagus070519V1", "vagus070519V2", "vagus071819V1", "vagus071819V2")] <- "projectionSeq"
+
+lapply(c("QZ1", "QZ2", "QZ3", "QZ4", "QZ5", "QZ6", "QZ7", "QZ8"), function(g) {plotUMAP(sce.vagus[,sce.vagus$group == "projectionSeq"], colour_by = g, point_size = 0.1, point_alpha = 0.4, text_by = "subpopulation")})
+
+QZ1 = "Stomach" #1120
+QZ2 = "Lung" #846
+QZ5 = "Oesophagus" #693
+QZ8 = "Heart" #160
+QZ6 = "Duodenum" #140
+QZ7 = "Pancreas" #251
+QZ3 = "Pancreas?" #155
+QZ4 = "Colon" #315
+
+code <- c("QZ1", "QZ2", "QZ3", "QZ4", "QZ5", "QZ6", "QZ7", "QZ8")
+
+sce.labeled <- sce.vagus[code, which(assay(sce.vagus)["QZ1",] > 0 | assay(sce.vagus)["QZ2",] > 0 | assay(sce.vagus)["QZ3",] > 0 | assay(sce.vagus)["QZ4",] > 0 | assay(sce.vagus)["QZ5",] > 0 | assay(sce.vagus)["QZ6",] > 0 | assay(sce.vagus)["QZ7",] > 0 | assay(sce.vagus)["QZ8",] > 0)]
+plotExpression(sce.labeled, features = c("WPRE", "tdTomato", "eGFP", "QZ1", "QZ2", "QZ3", "QZ4", "QZ5", "QZ6", "QZ7", "QZ8", "newGlp1r"), x = I(as.factor(sce.labeled$sample)), col = I(as.factor(sce.labeled$sample))) + theme(axis.text.x = element_text(angle = 90))
+
+sce.labeled <- sce.labeled[,sce.labeled$group == "projectionSeq"]
+
+lapply(c("QZ1", "QZ2", "QZ3", "QZ4", "QZ5", "QZ6", "QZ7", "QZ8"), function(g) {plotUMAP(sce.labeled[,sce.labeled$group == "projectionSeq"], colour_by = g, point_size = 0.1, point_alpha = 0.4, text_by = "subpopulation")})
+
+sce.labeled <- sce.labeled[,sce.labeled$subpopulation != "E"]
+
+stats <- perCellQCMetrics(sce.labeled)
+sum.qc <- stats$sum < 2
+stats$sum.qc <- sum.qc
+ggplot(as.data.frame(stats), aes(x = sum)) + geom_density() + scale_x_log10() + geom_vline(xintercept = 2)
+ggplot(as.data.frame(stats), aes(x = detected)) + geom_density() 
+ggplot(as.data.frame(stats), aes(x = sum, y = detected, col = sum.qc)) + geom_point() + scale_x_log10() + geom_vline(xintercept = 2)
+
+sce.labeled$discard <- sum.qc
+sce.labeled <- sce.labeled[,!sce.labeled$discard]
+Heatmap(as.matrix(logcounts(sce.labeled)), show_column_names = FALSE)
+
+pca <- prcomp(t(logcounts(sce.labeled)), scale = TRUE)
+fviz_pca_var(pca, col.var = "contrib", repel = TRUE, axes = c(1,2))
+reducedDim(sce.labeled, "PCA") <- pca$x
+plotPCA(sce.labeled, colour_by = "sample")
+lapply(code, function(g) plotPCA(sce.labeled, colour_by = g, point_size = 1))
+
+set.seed(1001100)
+sce.labeled <- runTSNE(sce.labeled, dimred = "PCA")
+lapply(code, function(g) plotTSNE(sce.labeled, colour_by = g, point_size = 1))
+
+set.seed(10010)
+clust <- kmeans(t(as.matrix(logcounts(sce.labeled))), centers = 25, iter.max = 10)
+sce.labeled$clust <- clust$cluster
+sce.labeled$clust <- as.factor(sce.labeled$clust)
+pdf(here::here("placode_VSN_analysis", "labeled_cells_analysis", "plots.pdf"))
+plotTSNE(sce.labeled, colour_by = "clust", text_by = "clust")
+lapply(code, function(g) plotTSNE(sce.labeled, colour_by = g, point_size = 1))
+plotExpression(sce.labeled, features = code, x = I(as.factor(sce.labeled$clust)), colour_by = I(as.factor(sce.labeled$clust)), point_size = 0, show_violin = TRUE) + theme(axis.text.x = element_text(angle = 90))
+dev.off()
+
+sce.labeled$target.code <- "NA"
+sce.labeled$target.code[sce.labeled$clust %in% c(1)] <- "QZ4.QZ7" 
+sce.labeled$target.code[sce.labeled$clust %in% c(2,5,7,15)] <- "QZ1" 
+sce.labeled$target.code[sce.labeled$clust %in% c(3,6,16)] <- "QZ2" 
+sce.labeled$target.code[sce.labeled$clust %in% c(4,9,12,13,17,21)] <- "multiple" 
+sce.labeled$target.code[sce.labeled$clust %in% c(8,14,20)] <- "QZ5" 
+sce.labeled$target.code[sce.labeled$clust %in% c(10,18)] <- "QZ4" 
+sce.labeled$target.code[sce.labeled$clust %in% c(11)] <- "QZ6" 
+sce.labeled$target.code[sce.labeled$clust %in% c(19)] <- "QZ7" 
+sce.labeled$target.code[sce.labeled$clust %in% c(22)] <- "QZ3" 
+sce.labeled$target.code[sce.labeled$clust %in% c(23)] <- "QZ3.QZ7" 
+sce.labeled$target.code[sce.labeled$clust %in% c(24)] <- "QZ8"
+sce.labeled$target.code[sce.labeled$clust %in% c(25)] <- "QZ1.QZ5"
+
+table(sce.labeled$clust, sce.labeled$target.code)
+plotTSNE(sce.labeled, colour_by = "target.code", text_by = "target.code")
+lapply(code, function(g) plotTSNE(sce.labeled, colour_by = g, point_size = 1))
+
+table(sce.labeled$subpopulation, sce.labeled$target.code)
+table(sce.labeled$target.code)
+saveRDS(sce.labeled, here::here("placode_VSN_analysis", "sce.labeled_neurons.rds"))
+
+sce.vagus$target.code <- colData(sce.labeled)[match(colnames(sce.vagus), colnames(sce.labeled)), "target.code"]
+sce.vagus.labeled <- sce.vagus[,!is.na(sce.vagus$target.code)]
+
+genes <- c("Kcng1", "Lpar3", "Aqp1", "Smco4", "Bmp3", "Vip", "Lypd1", "Igf1", "Wdr72", "Ptgfr", "Gda", "Pnlip", "Rbp4", "Dbh", "Htr3b", "Bub3", "Lrpprc", "Rtp1", "Rmst", "Chil1", "Nrxn3", "Pcdh9", "Mef2c", "St18", "Sema5a", "Etv1")
+
+sce.sub <- sce.vagus.labeled[genes, ]
+sce.sub <- sce.sub[,sce.sub$target.code %in% c("QZ1", "QZ2", "QZ3", "QZ4", "QZ5", "QZ6", "QZ7", "QZ8")]
+sce.sub$target.code <- factor(sce.sub$target.code, levels = c("QZ2", "QZ8", "QZ5", "QZ1", "QZ6", "QZ4", "QZ7", "QZ3"))
+cells <- data.frame(cells = colnames(sce.sub), target.code = sce.sub$target.code)
+cells.order <- cells[order(cells$target.code), ]
+sce.sub <- sce.sub[,cells.order$cells]
+mat <- as.matrix(logcounts(sce.sub))
+mat.scaled <- t(scale(t(mat)))
+ann <- HeatmapAnnotation(target.code = cells.order$target.code)
+pdf(here::here("placode_VSN_analysis", "labeled_cells_analysis", "DE_genes_VSNs_innervating_target_organs.heatmap.pdf"))
+Heatmap(mat.scaled, col = colorRamp2(c(-2, 0, 4), c("grey", "white", "red")), show_column_names = FALSE, top_annotation = ann, cluster_columns = FALSE, cluster_rows = FALSE)
+dev.off()
+
+
+```
+
+
+```{r}
+sce.vagus.labeled <- sce.vagus.labeled[,sce.vagus.labeled$target.code %in% code]
+sce.vagus.labeled$sample <- droplevels(sce.vagus.labeled$sample)
+summary_stats <- summaryMarkerStats(sce.vagus.labeled, sce.vagus.labeled$target.code)
+markers <- findMarkers(sce.vagus.labeled, sce.vagus.labeled$target.code, direction = "up", block = sce.vagus.labeled$sample, row.data = summary_stats)
+
+top <- vector("list", length(markers))
+top <- lapply(names(markers), function(x) {
+  c <- markers[[x]]
+  c200 <- c[1:200, ]
+  colnames(c200) <- paste0(colnames(c200), ".", x)
+  c200$Gene <- rownames(c200)
+  rownames(c200) <- NULL
+  #c200 <- c200[,c("Gene", "FDR", "summary.logFC")]
+  return(c200)
+}) 
+names(top) <- names(markers)
+merged <- Reduce(function(x, y) merge(x, y, all = TRUE, by = "Gene"), top)
+
+write.csv(merged, file = here::here("placode_VSN_analysis", "topGenes.markers_for_VSNs_from_target_regions.csv"))
+
+genes <- merged$Gene
+sce.sub <- sce.vagus.labeled[genes, ]
+sce.sub$target.code <- factor(sce.sub$target.code, levels = c("QZ2", "QZ8", "QZ5", "QZ1", "QZ6", "QZ4", "QZ7", "QZ3"))
+cells <- data.frame(cells = colnames(sce.sub), target.code = sce.sub$target.code)
+cells.order <- cells[order(cells$target.code), ]
+sce.sub <- sce.sub[,cells.order$cells]
+mat <- as.matrix(logcounts(sce.sub))
+mat.scaled <- t(scale(t(mat)))
+ann <- HeatmapAnnotation(target.code = cells.order$target.code)
+pdf(here::here("placode_VSN_analysis", "labeled_cells_analysis", "topGenes.markers_for_VSNs_from_target_regions.heatmap.pdf"), height = 20)
+Heatmap(mat.scaled, col = colorRamp2(c(-4, 0, 4), c("blue", "white", "red")), show_column_names = FALSE, top_annotation = ann, cluster_columns = FALSE, cluster_rows = TRUE, show_row_dend = FALSE, row_names_gp = gpar(fontsize = 2))
+dev.off()
+
+pdf(here::here("placode_VSN_analysis", "labeled_cells_analysis", "topGenes.markers_for_VSNs_from_target_regions.grouped_heatmap.pdf"), height = 20)
+print(plotGroupedHeatmap(sce.vagus.labeled, features = genes, group = "target.code", center = TRUE, symmetric = TRUE))
+dev.off()
+
+clust_summary <- summarizeAssayByGroup(sce.vagus.labeled, ids = sce.vagus.labeled$target.code, statistics = "mean")
+means <- assay(clust_summary, "mean")
+means <- means[genes, code]
+
+library(ggcorrplot)
+corr1 <- cor(means)
+p.mat <- cor_pmat(means)
+pdf(here::here("placode_VSN_analysis", "labeled_cells_analysis", "correlation_between_barcodes.pdf"))
+Heatmap(corr1, name = "corr")
+dev.off()
+```
+
+```{r}
+QZ1 = "Stomach" #1120
+QZ2 = "Lung" #846
+QZ5 = "Oesophagus" #693
+QZ8 = "Heart" #160
+QZ6 = "Duodenum" #140
+QZ7 = "Pancreas" #251
+QZ3 = "Pancreas?" #155
+QZ4 = "Colon" #315
+
+sce.vagus.labeled$target.organ[sce.vagus.labeled$target.code == "QZ1"] <- "S"
+sce.vagus.labeled$target.organ[sce.vagus.labeled$target.code == "QZ2"] <- "L"
+sce.vagus.labeled$target.organ[sce.vagus.labeled$target.code == "QZ5"] <- "E"
+sce.vagus.labeled$target.organ[sce.vagus.labeled$target.code == "QZ8"] <- "H"
+sce.vagus.labeled$target.organ[sce.vagus.labeled$target.code == "QZ6"] <- "D"
+sce.vagus.labeled$target.organ[sce.vagus.labeled$target.code == "QZ7"] <- "P"
+sce.vagus.labeled$target.organ[sce.vagus.labeled$target.code == "QZ3"] <- "P"
+sce.vagus.labeled$target.organ[sce.vagus.labeled$target.code == "QZ4"] <- "C"
+sce.vagus.labeled$bodily.region[sce.vagus.labeled$target.organ %in% c("E", "H", "L")] <- "thoracic"
+sce.vagus.labeled$bodily.region[sce.vagus.labeled$target.organ %in% c("S", "D", "C", "P")] <- "abdominal"
+
+summary_stats <- summaryMarkerStats(sce.vagus.labeled, sce.vagus.labeled$bodily.region)
+markers <- findMarkers(sce.vagus.labeled, sce.vagus.labeled$bodily.region, block = sce.vagus.labeled$sample, row.data = summary_stats)
+sc.abdominal.FC <- markers[["abdominal"]]
+sc.abdominal.FC <- sc.abdominal.FC[sc.abdominal.FC$FDR <= 0.001, ]
+
+#patt <- read.csv(here::here("data", "Gastric-vs-Distal.DE.gt2peptide.csv"), header = TRUE) #Read in proteomics result for Gastric vs Distal comparison
+patt <- read.csv(here::here("data", "Gastric-vs-Nodose.DE.gt2peptide.csv"), header = TRUE) #Read in proteomics result for Gastric vs Nodose comparison
+
+table(duplicated(patt$genes))
+patt <- patt[!duplicated(patt$genes), ]
+patt <- patt[abs(patt$logFC) >= 1, ]
+
+common_genes <- intersect(rownames(sc.abdominal.FC), patt$genes)
+sc.abdominal.FC <- sc.abdominal.FC[common_genes, ]
+sc.FC <- as.data.frame(sc.abdominal.FC$logFC.thoracic)
+rownames(sc.FC) <- rownames(sc.abdominal.FC)
+colnames(sc.FC) <- "sc.abdominal"
+
+rownames(patt) <- patt$genes
+patt <- patt[common_genes, ]
+Gas <- as.data.frame(patt$logFC)
+rownames(Gas) <- patt$genes
+colnames(Gas) <- "pr.FC"
+
+all.equal(rownames(Gas), rownames(sc.FC))
+
+mydat <- cbind(sc.FC, Gas)
+colnames(mydat) <- c("sc.abdominal.FC", "proteomics.Gas.Nod.FC")
+write.csv(mydat, file = here::here("placode_VSN_analysis", "DE_genes_between_abdominal_thoracic_VSNs.also_DE_in_gastric_vs_nodose_prot_logFCge1.csv"))
+
+
+cor.test(sc.FC$sc.abdominal, Gas$pr.FC)
+plot(sc.FC$sc.abdominal, Gas$pr.FC)
+
+comp <- data.frame(sign(sc.FC$sc.abdominal), sign(Gas$pr.FC))
+table(comp$sign.sc.FC.sc.abdominal. + comp$sign.Gas.pr.FC.)
+agree <- which((comp$sign.sc.FC.sc.abdominal. + comp$sign.Gas.pr.FC.) != 0)
+
+#Heatmap for proteomic logFC >=1
+sce.vagus.labeled$target.organ <- factor(sce.vagus.labeled$target.organ, levels = c("E", "H", "L", "S", "D", "C", "P"))
+clust_summary <- summarizeAssayByGroup(sce.vagus.labeled, ids = sce.vagus.labeled$target.organ, statistics = "mean")
+mat <- as.matrix(assay(clust_summary, "mean")[common_genes,])
+mat <- mat[agree, ]
+mat <- t(scale(t(mat)))
+
+sc.FC.2 <- sc.FC[agree, ]
+names(sc.FC.2) <- rownames(sc.FC)[agree]
+Gas.2 <- Gas[agree, ]
+names(Gas.2) <- rownames(Gas)[agree]
+myord <- order(sc.FC.2, decreasing = TRUE)
+mat <- mat[myord, ]
+sc.FC.2.ord <- sc.FC.2[myord]
+names(sc.FC.2.ord) <- names(sc.FC.2)[myord]
+Gas.2.ord <- Gas.2[myord]
+names(Gas.2.ord) <- names(Gas.2)[myord]
+
+all.equal(rownames(Gas.2.ord), rownames(sc.FC.2.ord), rownames(mat))
+
+organ.colors <- brewer.pal(7, "Set2")
+names(organ.colors) <- c("E", "H", "L", "S", "D", "C", "P")
+region.colors <- brewer.pal(5, "Set1")[c(4,3)]
+names(region.colors) <- c("thoracic", "abdominal")
+col_ann <- HeatmapAnnotation(Organ = factor(c("E", "H", "L", "S", "D", "C", "P"), levels = c("E", "H", "L", "S", "D", "C", "P")), Region = rep(c("thoracic", "abdominal"), c(3,4)), col = list(Organ = organ.colors, Region = region.colors), annotation_name_side = "left")
+pdf(here::here("placode_VSN_analysis", "DE_genes_between_abdominal_thoracic_VSNs.also_DE_in_gastric_vs_nodose_prot_logFCge1.pdf"), height = 10)
+Heatmap(mat, name = "meanExp",  col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")), top_annotation = col_ann, cluster_columns = FALSE, cluster_rows = FALSE, row_names_gp = gpar(fontsize = 8), show_row_dend = FALSE, column_title = "Labeled VSNs") + Heatmap(sc.FC.2.ord, name = "sc.FC",  col = colorRamp2(c(-0.6, 0, 0.6), c("blue", "white", "red")), row_names_gp = gpar(fontsize = 4)) + Heatmap(Gas.2.ord, name = "Proteomics.Gas-Nod.FC",  col = colorRamp2(c(-4, 0, 4), c("blue", "white", "red")), row_names_gp = gpar(fontsize = 4))
+#Heatmap(mat, name = "meanExp", col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")), top_annotation = col_ann,cluster_columns = FALSE, cluster_rows = FALSE, row_names_gp = gpar(fontsize = 8), show_row_dend = FALSE, column_title = "Labeled VSNs") + Heatmap(sc.FC.2.ord, name = "sc.FC", col = colorRamp2(c(-0.7, 0, 0.5), c("blue", "white", "red")), row_names_gp = gpar(fontsize = 4)) + Heatmap(Gas.2.ord, name = "Proteomics.Gas-Dis.FC", col = colorRamp2(c(-4, 0, 4), c("blue", "white", "red")), row_names_gp = gpar(fontsize = 4))
+dev.off()
+
+mydat <- data.frame(Gene = rownames(mat), sc.FC = sc.FC.2.ord, proteomics.Gas.Dis.FC = Gas.2.ord)
+write.csv(mydat, file = here::here("placode_VSN_analysis", "DE_genes_between_abdominal_thoracic_VSNs.also_DE_in_gastric_vs_distal_prot_logFCge1.csv"), row.names = FALSE)
+
+
+```
+
+#Psuedobulk and DE between abdominal and thoracic regions.
+```{r}
+library(edgeR)
+library(muscat)
+
+genes_expr <- nexprs(sce.vagus.labeled, byrow = TRUE)
+sce.vagus.labeled <- sce.vagus.labeled[genes_expr > 0, ] #Remove genes not expressed at all by any cell 
+coldata <- data.frame(sample = sce.vagus.labeled$sample, group = sce.vagus.labeled$bodily.region)
+rownames(coldata) <- rownames(colData(sce.vagus.labeled))
+sce.new <- SingleCellExperiment(assays = list(counts = counts(sce.vagus.labeled)), colData = coldata)
+sce.new$sample <- paste0(sce.new$sample, "_", sce.new$group)
+sce.new$cluster <- 1
+sce.agg <- aggregateAcrossCells(sce.new, ids = colData(sce.new)[c("cluster", "sample")])
+colnames(sce.agg) <- sce.agg$sample
+
+y <- DGEList(counts(sce.agg), samples=colData(sce.agg))
+keep <- filterByExpr(y, group = y$samples$group)
+y <- y[keep, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y)
+
+group <- factor(y$samples$group, levels = c("thoracic", "abdominal"))
+batch <- factor(sapply(y$samples$sample, function(x) unlist(strsplit(x, "_"))[1]))
+design <- model.matrix(~batch + group)
+
+plotMDS(cpm(y, log = TRUE))
+
+v <- voom(y, design, plot = TRUE)
+fit <- lmFit(v)
+fit <- eBayes(fit, robust = TRUE)
+res <- topTable(fit, coef = 5, sort.by="p", n=Inf)
+hist(res$P.Value)
+
+library(fgsea)
+library(data.table)
+library(gridExtra)
+Gas.Dis <- read.csv(here::here("data", "Gastric-vs-Distal.DE.gt2peptide.csv"), header = TRUE) #Read in proteomics result for Gastric vs Distal comparison
+Gas.Dis.UP <- Gas.Dis[Gas.Dis$logFC > 0, "GeneSymbol"]
+Gas.Dis.DOWN <- Gas.Dis[Gas.Dis$logFC < 0, "GeneSymbol"]
+gene_list <- list("Gas.Dis.UP" = Gas.Dis.UP, "Gas.Dis.DOWN" = Gas.Dis.DOWN)
+ranks <- res$t
+names(ranks) <- rownames(res)
+fgseaRes <- fgsea(pathways=gene_list, stats=ranks, eps=0)
+plot(plotGseaTable(gene_list, ranks, fgseaRes, gseaParam=0.5))
+```
+
+
+#AUCell
+```{r}
+#patt <- read.csv(here::here("data", "Gastric-vs-Nodose.DE.gt2peptide.csv"), header = TRUE)
+patt <- read.csv(here::here("data", "Gastric-vs-Distal.DE.gt2peptide.csv"), header = TRUE)
+table(duplicated(patt$genes))
+patt <- patt[!duplicated(patt$genes), ]
+pattern <- as.matrix(patt$logFC)
+rownames(pattern) <- patt$genes
+
+
+genes.Gas.Nod <- rownames(pattern)[pattern > 0]
+genes.Gas.Dis <- rownames(pattern)[pattern > 0]
+
+mydat <- logcounts(sce.vagus.labeled)
+mydat <- as.matrix(mydat)
+mydat <- mydat[rowSums(mydat) != 0, ]
+
+library(AUCell)
+geneSets <- list(Gastric.Nodose = genes.Gas.Nod, Gastric.Distal = genes.Gas.Dis) 
+cells_rankings <- AUCell_buildRankings(mydat, nCores=1, plotStats=TRUE)
+cells_AUC <- AUCell_calcAUC(geneSets, cells_rankings, aucMaxRank = ceiling(0.20 * nrow(cells_rankings)))
+
+AUC <- getAUC(cells_AUC)
+all.equal(colnames(AUC), colnames(sce.vagus.labeled))
+colData(sce.vagus.labeled) <- cbind(colData(sce.vagus.labeled), t(AUC))
+
+aucdat <- as.data.frame(colData(sce.vagus.labeled)[,c("target.organ", "bodily.region", "Gastric.Nodose", "Gastric.Distal")])
+pmelt <- reshape2::melt(aucdat)
+colnames(pmelt) <- c("target.organ", "region", "proteomics.comparison", "AUC")
+#pdf(here::here("integrated_analysis", "cluster.k3", "AUC.Gastric-vs-Nodose.DE_genes.10x.pdf"))
+ggplot(pmelt, aes(x = AUC, fill = region)) + geom_density(alpha = 0.4) + facet_wrap(~proteomics.comparison)
+ggplot(pmelt, aes(x = target.organ, y = AUC, col = region)) + geom_boxplot() + facet_wrap(~proteomics.comparison)
+ggplot(pmelt, aes(x = region, y = AUC, col = region)) + geom_boxplot() + facet_wrap(~proteomics.comparison) + theme(axis.text.x = element_text(angle = 90))
+#dev.off()
+
+```
+
+
+#Save
+```{r}
+saveRDS(sce, here::here("sce.wholenodose.rds"))
+
+saveRDS(sce.vagus, here::here("placode_VSNs.rds"))
+sce.vagus <- readRDS(here::here("placode_VSNs.rds")) 
+
+saveRDS(sce.vagus.labeled, here::here("placode_VSN_analysis", "sce.labeled_neurons.rds"))
+sce.vagus.labeled <- readRDS(here::here("placode_VSN_analysis", "sce.labeled_neurons.rds"))
+```
